@@ -1,184 +1,269 @@
-/******************************************************************************************
- *  rsa_mont.c
- *  Montgomery‑based RSA demo for the SENG440 lesson.
- *
- *  - Implements bit‑wise Montgomery multiplication (MMM)
- *  - Provides a modular‑exponentiation function that uses MMM
- *  - Shows the RSA example: P=61, Q=53, N=PQ=3233, E=17, D=2753
- *    Encrypts M=123 → C=855, then decrypts back to 123.
- *
- *  The code is written for a 32‑bit word size (the VM is ARM HF 32‑bit) but works
- *  for any modulus that fits in an unsigned int (≤ 32 bits).  For larger moduli
- *  you would need a multi‑precision version – not required for the lesson.
- *
- *  Compile (on the VM):
- *      gcc -Wall -Wextra -O2 -o rsa_mont rsa_mont.c
- *
- *  Run:
- *      ./rsa_mont
- *
- *  No external libraries are needed.
- ******************************************************************************************/
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 
-/*------------------------------ Montgomery Multiplication ------------------------------*/
-/*
- * Compute  (X * Y * R^-1) mod M
- * where R = 2^m  and  m = bit‑length of M.
- * The function assumes:
- *   - M is odd and > 1
- *   - 0 ≤ X, Y < M
- *   - The result also lies in [0, M-1].
- *
- * The algorithm follows the bit‑wise description given in the lesson:
- *   T = 0
- *   for i = 0 … m‑1
- *       η = T0 XOR (Xi AND Y0)
- *       T = (T + Xi·Y + η·M) >> 1
- *       if T ≥ M: T = T − M
- *   return T
- */
-static unsigned int montgomery_mul(unsigned int X,
-                                   unsigned int Y,
-                                   unsigned int M,
-                                   unsigned int m_bits)
-{
-    if (M == 0 || M == 1)               /* degenerate cases */
-        return 0;
-
-    unsigned int Y0 = Y & 1U;           /* least‑significant bit of Y */
-    unsigned long long T = 0ULL;        /* need up to ~3×M bits */
-
-    for (unsigned int i = 0; i < m_bits; ++i)
-    {
-        unsigned int Xi = (X >> i) & 1U;            /* i‑th bit of X (LSB=0) */
-        unsigned int T0 = (unsigned int)(T & 1ULL);/* LSB of T */
-        unsigned int eta = T0 ^ (Xi & Y0);          /* η = T0 xor (Xi & Y0) */
-
-        if (Xi) T += (unsigned long long)Y;         /* add Y if Xi=1 */
-        if (eta) T += (unsigned long long)M;       /* add M if η=1 */
-
-        T >>= 1ULL;                                 /* divide by 2 */
-
-        if (T >= (unsigned long long)M)            /* reduce if needed */
-            T -= (unsigned long long)M;
-    }
-    return (unsigned int)T;
+/* ============================================================
+ * Utility: GCD (Euclidean algorithm)
+ * ============================================================ */
+static uint64_t gcd(uint64_t a, uint64_t b) {
+    while (b) { uint64_t t = b; b = a % b; a = t; }
+    return a;
 }
 
-/*------------------------------ Modular Exponentiation -------------------------------*/
-/*
- * Compute base^exp mod M using Montgomery multiplication.
- * Steps:
- *   1. Determine m = bit‑length of M.
- *   2. Pre‑compute R = 2^m mod M   and   R2 = R^2 mod M.
- *   3. Convert base to Montgomery domain:  x̄ = base * R2 mod M   (via MMM)
- *   4. Initialise result in Montgomery domain: r̄ = R mod M   (i.e. 1·R mod M)
- *   5. Square‑and‑multiply loop using MMM.
- *   6. Convert result back from Montgomery domain:  result = r̄ * 1 mod M   (via MMM with Y=1)
- */
-static unsigned int mod_exp_mont(unsigned int base,
-                                 unsigned int exp,
-                                 unsigned int M)
-{
-    if (M == 0) return 0;
-    if (M == 1) return 0;               /* everything ≡ 0 (mod 1) */
-
-    /* Determine bit‑length of M */
-    unsigned int m_bits = 0;
-    unsigned int mm = M;
-    while (mm) {
-        ++m_bits;
-        mm >>= 1;
-    }
-    if (m_bits == 0) return 0;          /* should not happen for M≥2 */
-
-    /* R = 2^m mod M */
-    unsigned int R = 1U;
-    for (unsigned int i = 0; i < m_bits; ++i)
-        R = (R << 1) % M;
-
-    /* R2 = R^2 mod M */
-    unsigned int R2 = (R * R) % M;
-
-    /* Convert base to Montgomery domain: base * R2 mod M */
-    unsigned int base_mont = montgomery_mul(base, R2, M, m_bits);
-
-    /* Montgomery representation of 1 is R mod M */
-    unsigned int result_mont = R;   /* because 1 * R mod M = R */
-
-    /* Square‑and‑multiply */
-    unsigned int e = exp;
-    while (e) {
-        if (e & 1U)
-            result_mont = montgomery_mul(result_mont, base_mont, M, m_bits);
-        base_mont = montgomery_mul(base_mont, base_mont, M, m_bits);
-        e >>= 1;
-    }
-
-    /* Convert back from Montgomery domain: result * 1 mod M */
-    unsigned int result = montgomery_mul(result_mont, 1U, M, m_bits);
-    return result;
+/* ============================================================
+ * Utility: Simple primality check (trial division)
+ * ============================================================ */
+static int is_prime(uint64_t n) {
+    if (n < 2) return 0;
+    if (n == 2) return 1;
+    if (n % 2 == 0) return 0;
+    for (uint64_t i = 3; i * i <= n; i += 2)
+        if (n % i == 0) return 0;
+    return 1;
 }
 
-/*------------------------------ Demo / Test ----------------------------------------*/
-int main(void)
-{
-    /* RSA parameters from the lesson */
-    const unsigned int P = 61U;
-    const unsigned int Q = 53U;
-    const unsigned int N = P * Q;        /* modulus */
-    const unsigned int E = 17U;          /* public exponent */
-    const unsigned int D = 2753U;        /* private exponent */
-    const unsigned int M = 123U;         /* plaintext message */
+/* ============================================================
+ * Utility: Print an integer in binary (MSB first, 'bits' wide)
+ * ============================================================ */
+static void print_binary(uint64_t val, int bits) {
+    for (int i = bits - 1; i >= 0; i--)
+        printf("%d", (int)((val >> i) & 1ULL));
+}
 
-    printf("=== RSA demo using Montgomery multiplication ===\n");
-    printf("P = %u\n", P);
-    printf("Q = %u\n", Q);
-    printf("N = P·Q = %u\n", N);
-    printf("Public exponent  E = %u\n", E);
-    printf("Private exponent D = %u\n", D);
-    printf("Plaintext  M = %u\n\n", M);
+/* ============================================================
+ * Montgomery Modular Multiplication (MMM)
+ * Returns Z = (X * Y * R^-1) mod M,  R = 2^m, m = bit-length of M
+ * Algorithm from the SENG 440 lecture slides (bit-wise version).
+ * ============================================================ */
+uint64_t MMM(uint64_t X, uint64_t Y, uint64_t M) {
+    if (M <= 1) return 0;
 
-    /* Encrypt: C = M^E mod N */
-    unsigned int C = mod_exp_mont(M, E, N);
-    printf("Ciphertext C = M^E mod N = %u\n", C);
+    /* Determine m = bit-length of M */
+    int m = 0;
+    uint64_t tmp = M;
+    while (tmp) { m++; tmp >>= 1; }
 
-    /* Decrypt: M' = C^D mod N */
-    unsigned int Mp = mod_exp_mont(C, D, N);
-    printf("Decrypted  M' = C^D mod N = %u\n", Mp);
+    uint64_t Y0 = Y & 1ULL;
+    uint64_t T  = 0ULL;
 
-    /* Verify */
-    if (Mp == M)
-        printf("\nSUCCESS: Decryption recovered the original plaintext.\n");
-    else
-        printf("\nERROR: Decryption failed.\n");
-
-    /* Optional: Show that MMM really computes (X·Y·R⁻¹) mod N */
-    printf("\n--- Quick sanity check of MMM ---\n");
-    unsigned int X = 123U, Y = 1U;          /* trivial test */
-    unsigned int mN = 0U;                   /* bit‑length of N */
-    {
-        unsigned int tmp = N;
-        while (tmp) { ++mN; tmp >>= 1; }
+    for (int i = 0; i < m; i++) {
+        uint64_t Xi  = (X >> i) & 1ULL;
+        uint64_t T0  = T & 1ULL;
+        uint64_t eta = T0 ^ (Xi & Y0);    /* eta = T[0] XOR (X[i] AND Y[0]) */
+        if (Xi)  T += Y;
+        if (eta) T += M;
+        T >>= 1;
     }
-    unsigned int R = 1U;
-    for (unsigned int i = 0; i < mN; ++i) R = (R << 1) % N;
-    unsigned int Rinv = 0U;                 /* we could compute it with extended Euclid,
-                                            but for the demo we just trust the lesson */
-    /* Using the known Rinv from the lesson: 1742 */
-    Rinv = 1742U;
-    unsigned int mmm_res = montgomery_mul(X, Y, N, mN);
-    unsigned int brute = (X * Y * Rinv) % N;
-    printf("MMM(%u,%u,%u,%u) = %u\n", X, Y, N, mN, mmm_res);
-    printf("(X·Y·R⁻¹) %% N = %u\n", brute);
-    if (mmm_res == brute)
-        printf("MMM matches the brute‑force computation.\n");
-    else
-        printf("MMM mismatch!\n");
+    if (T >= M) T -= M;
+    return T;
+}
 
-    return EXIT_SUCCESS;
+/* ============================================================
+ * Montgomery Modular Exponentiation (MME)
+ * Computes Base^Exp mod M using left-to-right square-and-multiply,
+ * operating entirely in the Montgomery domain.
+ * ============================================================ */
+uint64_t MME(uint64_t Base, uint64_t Exp, uint64_t M, int verbose) {
+    if (M <= 1) return 0;
+
+    /* 1. Determine m and derive R = 2^m mod M, R^2 mod M */
+    int m = 0;
+    uint64_t tmp = M;
+    while (tmp) { m++; tmp >>= 1; }
+
+    uint64_t R  = (1ULL << m) % M;
+    uint64_t R2 = (R * R) % M;
+
+    if (verbose) {
+        printf("  m (bit-length of M=%" PRIu64 ")  = %d\n", M, m);
+        printf("  R  = 2^m mod M            = %" PRIu64 "\n", R);
+        printf("  R^2 mod M                 = %" PRIu64 "\n", R2);
+    }
+
+    /* 2. Scale Base into the Montgomery domain: X' = Base * R mod M */
+    uint64_t X_scaled = MMM(Base, R2, M);
+    if (verbose)
+        printf("  Base' = MMM(%" PRIu64 ", R^2, M)  = %" PRIu64
+               "  [Base scaled into Montgomery domain]\n",
+               Base, X_scaled);
+
+    /* 3. Initialise accumulator as 1 in Montgomery domain: Z' = R mod M */
+    uint64_t Z_scaled = R;
+    if (verbose)
+        printf("  Z'  initialised to R mod M = %" PRIu64
+               "  [represents 1 in Montgomery domain]\n\n", Z_scaled);
+
+    /* 4. Determine exponent bit-length */
+    int exp_bits = 0;
+    uint64_t te = Exp;
+    while (te) { exp_bits++; te >>= 1; }
+
+    if (verbose) {
+        printf("  Exponent %" PRIu64 " in binary = ", Exp);
+        print_binary(Exp, exp_bits);
+        printf("  (%d bits)\n\n", exp_bits);
+        printf("  %-5s  %-3s  %-12s  %-12s  %-12s\n",
+               "Step", "Bit", "Z' (before)", "Z' (squared)", "Z' (x Base')");
+        printf("  %-5s  %-3s  %-12s  %-12s  %-12s\n",
+               "-----","---","------------","------------","------------");
+    }
+
+    /* 5. Left-to-right square-and-multiply in Montgomery domain */
+    for (int i = exp_bits - 1; i >= 0; i--) {
+        uint64_t ei      = (Exp >> i) & 1ULL;
+        uint64_t before  = Z_scaled;
+
+        Z_scaled         = MMM(Z_scaled, Z_scaled, M);   /* square */
+        uint64_t squared = Z_scaled;
+
+        if (ei) Z_scaled = MMM(Z_scaled, X_scaled, M);   /* multiply */
+
+        if (verbose)
+            printf("  %-5d  %-3" PRIu64 "  %-12" PRIu64 "  %-12" PRIu64
+                   "  %s\n",
+                   exp_bits - 1 - i, ei,
+                   before, squared,
+                   ei ? "yes -> " : "no  (skip)");
+        if (verbose && ei)
+            printf("  %38s%-12" PRIu64 "\n", "", Z_scaled);
+    }
+
+    /* 6. Scale result back from Montgomery domain: Z = Z' * 1 * R^-1 mod M */
+    uint64_t Z = MMM(Z_scaled, 1ULL, M);
+    if (verbose)
+        printf("\n  Z' = %" PRIu64
+               "  =>  Z = MMM(Z', 1, M) = %" PRIu64
+               "  [scaled back from Montgomery domain]\n", Z_scaled, Z);
+
+    return Z;
+}
+
+/* ============================================================
+ * RSA parameter validation
+ * Returns 1 if all checks pass, 0 otherwise.
+ * Also fills in *M_out and *phi_out.
+ * ============================================================ */
+static int validate_rsa(uint64_t P, uint64_t Q, uint64_t E, uint64_t D,
+                        uint64_t *M_out, uint64_t *phi_out) {
+    int ok = 1;
+    printf("\n=== RSA Parameter Validation ===\n");
+
+    if (!is_prime(P)) {
+        printf("  [FAIL] P = %" PRIu64 " is NOT prime.\n", P); ok = 0;
+    } else printf("  [ OK ] P = %" PRIu64 " is prime.\n", P);
+
+    if (!is_prime(Q)) {
+        printf("  [FAIL] Q = %" PRIu64 " is NOT prime.\n", Q); ok = 0;
+    } else printf("  [ OK ] Q = %" PRIu64 " is prime.\n", Q);
+
+    if (!ok) return 0;   /* can't proceed without valid primes */
+
+    if (P == Q) {
+        printf("  [FAIL] P and Q must be distinct primes.\n"); return 0;
+    } else printf("  [ OK ] P != Q.\n");
+
+    uint64_t M   = P * Q;
+    uint64_t phi = (P - 1) * (Q - 1);
+    *M_out   = M;
+    *phi_out = phi;
+    printf("  [ OK ] M   = P * Q       = %" PRIu64 "\n", M);
+    printf("  [ OK ] phi = (P-1)*(Q-1) = %" PRIu64 "\n", phi);
+
+    if (E <= 1 || E >= phi) {
+        printf("  [FAIL] E = %" PRIu64 " must satisfy 1 < E < phi (%" PRIu64 ").\n",
+               E, phi); ok = 0;
+    } else printf("  [ OK ] E = %" PRIu64 " is in range (1, phi).\n", E);
+
+    if (gcd(E, phi) != 1) {
+        printf("  [FAIL] gcd(E=%" PRIu64 ", phi=%" PRIu64 ") = %" PRIu64
+               " != 1  (E and phi must be coprime).\n",
+               E, phi, gcd(E, phi)); ok = 0;
+    } else printf("  [ OK ] gcd(E=%" PRIu64 ", phi=%" PRIu64 ") = 1.\n", E, phi);
+
+    /* D * E ≡ 1 (mod phi)
+     * Computed as repeated doubling to avoid overflow on 32-bit targets
+     * where __uint128_t is unavailable.  Runs in O(64) iterations. */
+    uint64_t de_mod = 0;
+    uint64_t base   = D % phi;
+    uint64_t exp    = E;
+    while (exp) {
+        if (exp & 1ULL) {
+            de_mod += base;
+            if (de_mod >= phi) de_mod -= phi;
+        }
+        base += base;
+        if (base >= phi) base -= phi;
+        exp >>= 1;
+    }
+    if (de_mod != 1) {
+        printf("  [FAIL] D*E mod phi = %" PRIu64
+               " != 1  (D is not the multiplicative inverse of E).\n",
+               de_mod); ok = 0;
+    } else printf("  [ OK ] D*E mod phi = 1  (D is the multiplicative inverse of E).\n");
+
+    return ok;
+}
+
+/* ============================================================
+ * main
+ * ============================================================ */
+int main(void) {
+    uint64_t P, Q, E, D, M = 0, phi = 0;
+
+    printf("========================================\n");
+    printf("  RSA Cryptography Demo (Montgomery MMM)\n");
+    printf("========================================\n\n");
+
+    printf("Enter Prime P            (e.g.   61): "); scanf("%" SCNu64, &P);
+    printf("Enter Prime Q            (e.g.   53): "); scanf("%" SCNu64, &Q);
+    printf("Enter Public Exponent E  (e.g.   17): "); scanf("%" SCNu64, &E);
+    printf("Enter Private Exponent D (e.g. 2753): "); scanf("%" SCNu64, &D);
+
+    if (!validate_rsa(P, Q, E, D, &M, &phi)) {
+        printf("\n[ABORT] Invalid RSA parameters — please correct and retry.\n");
+        return 1;
+    }
+
+    printf("\n  All RSA parameters are VALID.\n");
+    printf("  Public  key : (E=%" PRIu64 ", M=%" PRIu64 ")\n", E, M);
+    printf("  Private key :  D=%" PRIu64 "\n\n", D);
+
+    uint64_t T;
+    printf("Enter plaintext T (integer, 0 < T < %" PRIu64 "): ", M);
+    scanf("%" SCNu64, &T);
+    if (T == 0 || T >= M) {
+        printf("[ABORT] Plaintext must satisfy 0 < T < %" PRIu64 ".\n", M);
+        return 1;
+    }
+
+    /* ---- ENCRYPTION --------------------------------------- */
+    printf("\n========================================\n");
+    printf("  ENCRYPTION:  C = T^E mod M\n");
+    printf("  T=%" PRIu64 ",  E=%" PRIu64 ",  M=%" PRIu64 "\n", T, E, M);
+    printf("========================================\n");
+    uint64_t C = MME(T, E, M, /*verbose=*/1);
+    printf("\n  >> Ciphertext  C = %" PRIu64 "\n", C);
+
+    /* ---- DECRYPTION --------------------------------------- */
+    printf("\n========================================\n");
+    printf("  DECRYPTION:  T' = C^D mod M\n");
+    printf("  C=%" PRIu64 ",  D=%" PRIu64 ",  M=%" PRIu64 "\n", C, D, M);
+    printf("========================================\n");
+    uint64_t T_dec = MME(C, D, M, /*verbose=*/1);
+    printf("\n  >> Recovered plaintext  T' = %" PRIu64 "\n", T_dec);
+
+    /* ---- VERIFICATION ------------------------------------- */
+    printf("\n========================================\n");
+    printf("  VERIFICATION\n");
+    printf("========================================\n");
+    printf("  Original  plaintext  T  = %" PRIu64 "\n", T);
+    printf("  Encrypted ciphertext C  = %" PRIu64 "\n", C);
+    printf("  Recovered plaintext  T' = %" PRIu64 "\n", T_dec);
+    if (T_dec == T)
+        printf("\n  [SUCCESS] T' == T.  RSA encrypt -> decrypt round-trip is correct!\n\n");
+    else
+        printf("\n  [FAILURE] T' != T.  Something went wrong.\n\n");
+
+    return 0;
 }
