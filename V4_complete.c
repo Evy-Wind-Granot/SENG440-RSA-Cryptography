@@ -1,3 +1,11 @@
+/* NOTE: this version adds 4x loop unrolling on top of V2_branchless.
+ * MEASURED REGRESSION on ARM32: -O2 timing got WORSE (47.5ns -> 56.2ns/call)
+ * due to register spilling (1 stack access in V2 vs 5 in this version,
+ * confirmed via objdump/assembly inspection).
+ * Kept for the presentation as a documented "tried and failed" case -
+ * V4_final.c (== V2_branchless.c) is the actual shipped/final version.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
