@@ -1,7 +1,27 @@
+/*******************************************************************************
+ * File:        main.c
+ *
+ * Description: Benchmark application for Montgomery Modular Multiplication (MMM).
+ *              Performs modular multiplication in Montgomery domain using
+ *              bit-by-bit radix-2 reduction.
+ ******************************************************************************/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
+/*******************************************************************************
+ * Function:    MMM
+ *
+ * Description: Computes Montgomery Modular Multiplication: (X * Y * 2^-m) mod M.
+ *
+ * Parameters:  X - First operand, bounded by 0 <= X < 2^m.
+ *              Y - Second operand, bounded by 0 <= Y < 2^m.
+ *              M - Modulus (must be an odd positive integer).
+ *              m - Bit length of the modulus M.
+ *
+ * Returns:     Result of the Montgomery modular multiplication in range [0, M-1].
+ ******************************************************************************/
 int MMM(int X, int Y, int M, int m)
 {
     int i;
@@ -13,6 +33,8 @@ int MMM(int X, int Y, int M, int m)
 
     T = 0;
     Y0 = Y & 1;
+
+    /* Process operands bit-by-bit from least significant to most significant bit. */
     for (i = 0; i < m; i++) {
         Xi = (X >> i) & 1;
         T0 = T & 1;
@@ -21,12 +43,24 @@ int MMM(int X, int Y, int M, int m)
         eta_M = eta ? M : 0;
         T = (T + Xi_Y + eta_M) >> 1;
     }
-    /* proven bound: at most 2 subtractions needed for m<=12, X,Y<2^m */
+
+    /* Proven bound: At most 2 subtractions needed for m <= 12, X, Y < 2^m. */
     if (T >= M) T -= M;
     if (T >= M) T -= M;
+
     return T;
 }
 
+/*******************************************************************************
+ * Function:    main
+ *
+ * Description: Entry point. Measures execution performance of MMM calls across
+ *              a fixed number of iterations.
+ *
+ * Parameters:  void
+ *
+ * Returns:     0 on successful completion.
+ ******************************************************************************/
 int main(void)
 {
     const int M = 3233;
@@ -35,18 +69,23 @@ int main(void)
     volatile long acc = 0;
 
     struct timespec t0, t1;
+
+    /* Record start timestamp. */
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
+    /* Benchmark loop executing pseudo-random inputs. */
     for (long i = 0; i < N; i++) {
         int X = (int)((i * 2654435761U) % 4096U);
         int Y = (int)((i * 40503U + 1) % 4096U);
         acc += MMM(X, Y, M, m);
     }
 
+    /* Record end timestamp and calculate elapsed runtime. */
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
     printf("v1_bounded_reduction: %ld MMM calls in %.4f s  (%.1f ns/call)  acc=%ld\n",
            N, secs, secs * 1e9 / N, acc);
+
     return 0;
 }
